@@ -1,14 +1,29 @@
 package com.visasim.userservice.model;
 
+import jakarta.persistence.*;
+
 import java.time.Instant;
 import java.util.UUID;
 
+@Entity
+@Table(name = "users")
 public class User {
 
-    private final UUID id;
+    @Id
+    private UUID id;
+
+    @Column(name = "full_name", nullable = false)
     private String fullName;
+
+    @Column(name = "email", nullable = false, unique = true)
     private String email;
-    private final Instant createdAt;
+
+    @Column(name = "created_at", nullable = false)
+    private Instant createdAt;
+
+    protected User() {
+        // required by JPA/Hibernate — never called directly by our code
+    }
 
     public User(String fullName, String email) {
         this.id = UUID.randomUUID();
