@@ -9,9 +9,12 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import com.visasim.userservice.exceptions.UserNotFoundException;
+import com.visasim.userservice.exceptions.WalletHasDependentDataException;
 import com.visasim.userservice.exceptions.WalletNotFoundException;
+import com.visasim.userservice.model.Transaction;
 import com.visasim.userservice.model.User;
 import com.visasim.userservice.model.Wallet;
+import com.visasim.userservice.repository.TransactionRepository;
 import com.visasim.userservice.repository.UserRepository;
 import com.visasim.userservice.repository.WalletRepository;
 
@@ -24,15 +27,18 @@ public class WalletService {
     private final WalletRepository walletRepository;
     private final UserRepository userRepository;
     private final TransactionTemplate transactionTemplate;
+    private final TransactionRepository transactionRepository;
 
     public WalletService(
             WalletRepository walletRepository,
             UserRepository userRepository,
-            TransactionTemplate transactionTemplate) {
+            TransactionTemplate transactionTemplate,
+            TransactionRepository transactionRepository) {
 
         this.walletRepository = walletRepository;
         this.userRepository = userRepository;
         this.transactionTemplate = transactionTemplate;
+        this.transactionRepository = transactionRepository;
     }
 
     public Wallet createWalletForUser(UUID userId) {
@@ -103,5 +109,17 @@ public class WalletService {
         }
 
         throw new IllegalStateException("Unexpected retry failure");
+    }
+
+    public void deleteWallet(UUID walletId) {
+        Wallet wallet = walletRepository.findById(walletId)
+                .orElseThrow(() -> new WalletNotFoundException(walletId));
+
+        boolean hasTransactions = transactionRepository.existsByFromWalletIdOrToWalletId(walletId, walletId);
+        if (hasTransactions) {
+            throw new WalletHasDependentDataException(walletId);
+        }
+
+        walletRepository.delete(wallet);
     }
 }

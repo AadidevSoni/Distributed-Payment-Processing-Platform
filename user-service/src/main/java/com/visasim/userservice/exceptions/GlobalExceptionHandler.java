@@ -60,4 +60,22 @@ public class GlobalExceptionHandler {
         body.put("error", "A record with conflicting unique data already exists.");
         return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
     }
+
+    @ExceptionHandler(UserHasDependentDataException.class)
+    public ResponseEntity<Map<String, Object>> handleUserHasDependentData(UserHasDependentDataException ex) {
+        Map<String, Object> body = new HashMap<>();
+        body.put("timestamp", Instant.now());
+        body.put("status", HttpStatus.CONFLICT.value());
+        body.put("error", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
+    }
+
+    @ExceptionHandler(WalletHasDependentDataException.class)
+    public ResponseEntity<Map<String, Object>> handleWalletHasDependentData(WalletHasDependentDataException ex) {
+        Map<String, Object> body = new HashMap<>();
+        body.put("timestamp", Instant.now());
+        body.put("status", HttpStatus.CONFLICT.value());
+        body.put("error", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(body);
+    }
 }
