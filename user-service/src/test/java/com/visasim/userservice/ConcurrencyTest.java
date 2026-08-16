@@ -41,7 +41,7 @@ public class ConcurrencyTest {
         );
         Wallet wallet = walletRepository.save(new Wallet(user.getId()));
 
-        int threadCount = 10;
+        int threadCount = 100;
         BigDecimal creditAmount = new BigDecimal("10.00");
 
         ExecutorService executor = Executors.newFixedThreadPool(threadCount);
