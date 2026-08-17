@@ -7,6 +7,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
 import com.visasim.userservice.event.TransactionCompletedEvent;
+import com.visasim.userservice.exceptions.DuplicateRequestException;
 import com.visasim.userservice.exceptions.TransactionNotFoundException;
 import com.visasim.userservice.exceptions.WalletNotFoundException;
 import com.visasim.userservice.model.Transaction;
@@ -22,20 +23,27 @@ public class TransactionService {
     private final TransactionAuditService transactionAuditService;
     private final TransactionEventProducer eventProducer;
     private final TransactionTemplate transactionTemplate;
+    private final IdempotencyService idempotencyService;
 
     public TransactionService(WalletRepository walletRepository,
                                TransactionRepository transactionRepository,
                                TransactionAuditService transactionAuditService,
                                TransactionEventProducer eventProducer,
-                               TransactionTemplate transactionTemplate) {
+                               TransactionTemplate transactionTemplate,
+                               IdempotencyService idempotencyService) {
         this.walletRepository = walletRepository;
         this.transactionRepository = transactionRepository;
         this.transactionAuditService = transactionAuditService;
         this.eventProducer = eventProducer;
         this.transactionTemplate = transactionTemplate;
+        this.idempotencyService = idempotencyService;
     }
 
-    public Transaction transfer(UUID fromWalletId, UUID toWalletId, BigDecimal amount) {
+    public Transaction transfer(UUID fromWalletId, UUID toWalletId, BigDecimal amount, String idempotencyKey) {
+
+        if (!idempotencyService.markIfFirstUse(idempotencyKey)) {
+            throw new DuplicateRequestException(idempotencyKey);
+        }
 
         Transaction transaction = transactionTemplate.execute(status -> {
 

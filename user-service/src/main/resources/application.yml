@@ -42,3 +42,8 @@ kafka:
     value-deserializer: org.springframework.kafka.support.serializer.JsonDeserializer
     properties:
       spring.json.trusted.packages: com.visasim.userservice.event
+
+data:
+  redis:
+    host: localhost
+    port: 6379

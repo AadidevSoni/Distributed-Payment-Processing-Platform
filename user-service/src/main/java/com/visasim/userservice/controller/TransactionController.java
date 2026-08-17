@@ -31,7 +31,7 @@ public class TransactionController {
     @PostMapping("/transfer")
     public ResponseEntity<TransactionResponse> transfer(@Valid @RequestBody TransferRequest request) {
         Transaction transaction = transactionService.transfer(
-                request.fromWalletId(), request.toWalletId(), request.amount());
+                request.fromWalletId(), request.toWalletId(), request.amount(), request.idempotencyKey());
         return ResponseEntity.status(HttpStatus.CREATED).body(TransactionResponse.fromTransaction(transaction));
     }
 
