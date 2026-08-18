@@ -8,10 +8,14 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import com.visasim.userservice.event.TransactionCompletedEvent;
 import com.visasim.userservice.exceptions.DuplicateRequestException;
+import com.visasim.userservice.exceptions.FraudBlockedException;
 import com.visasim.userservice.exceptions.TransactionNotFoundException;
 import com.visasim.userservice.exceptions.WalletNotFoundException;
+import com.visasim.userservice.model.FraudCheck;
+import com.visasim.userservice.model.FraudDecision;
 import com.visasim.userservice.model.Transaction;
 import com.visasim.userservice.model.Wallet;
+import com.visasim.userservice.repository.FraudCheckRepository;
 import com.visasim.userservice.repository.TransactionRepository;
 import com.visasim.userservice.repository.WalletRepository;
 
@@ -24,25 +28,37 @@ public class TransactionService {
     private final TransactionEventProducer eventProducer;
     private final TransactionTemplate transactionTemplate;
     private final IdempotencyService idempotencyService;
+    private final FraudCheckService fraudCheckService;
+    private final FraudCheckRepository fraudCheckRepository;
 
     public TransactionService(WalletRepository walletRepository,
                                TransactionRepository transactionRepository,
                                TransactionAuditService transactionAuditService,
                                TransactionEventProducer eventProducer,
                                TransactionTemplate transactionTemplate,
-                               IdempotencyService idempotencyService) {
+                               IdempotencyService idempotencyService,
+                               FraudCheckService fraudCheckService,
+                               FraudCheckRepository fraudCheckRepository) {
         this.walletRepository = walletRepository;
         this.transactionRepository = transactionRepository;
         this.transactionAuditService = transactionAuditService;
         this.eventProducer = eventProducer;
         this.transactionTemplate = transactionTemplate;
         this.idempotencyService = idempotencyService;
+        this.fraudCheckService = fraudCheckService;
+        this.fraudCheckRepository = fraudCheckRepository;
     }
 
     public Transaction transfer(UUID fromWalletId, UUID toWalletId, BigDecimal amount, String idempotencyKey) {
 
         if (!idempotencyService.markIfFirstUse(idempotencyKey)) {
             throw new DuplicateRequestException(idempotencyKey);
+        }
+
+        FraudCheck fraudCheck = fraudCheckService.evaluate(fromWalletId, toWalletId, amount);
+
+        if (fraudCheck.getDecision() == FraudDecision.BLOCK) {
+            throw new FraudBlockedException(fraudCheck.getReasons());
         }
 
         Transaction transaction = transactionTemplate.execute(status -> {
@@ -70,6 +86,9 @@ public class TransactionService {
                 throw ex;
             }
         });
+
+        fraudCheck.linkToTransaction(transaction.getId());
+        fraudCheckRepository.save(fraudCheck);
 
         // Publish only AFTER the database transaction has fully committed.
         // If the transfer failed, this line is never reached (the exception
