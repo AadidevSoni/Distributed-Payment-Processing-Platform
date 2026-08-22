@@ -1,0 +1,30 @@
+server:
+  port: 8082
+
+user-service:
+  base-url: http://user-service:8081
+
+spring:
+  application:
+    name: fraud-service
+
+  datasource:
+    url: jdbc:postgresql://localhost:5433/visasim_fraud
+    username: visasim
+    password: visasim_dev_password
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info

@@ -1,0 +1,12 @@
+com/visasim/fraudservice/FraudServiceApplication.class
+com/visasim/fraudservice/model/FraudCheck.class
+com/visasim/fraudservice/service/FraudCheckService.class
+com/visasim/fraudservice/controller/FraudCheckController.class
+com/visasim/fraudservice/client/UserServiceClient$1.class
+com/visasim/fraudservice/model/FraudDecision.class
+com/visasim/fraudservice/client/UserServiceClient.class
+com/visasim/fraudservice/controller/FraudCheckController$EvaluateRequest.class
+com/visasim/fraudservice/dto/TransactionHistoryResponse.class
+com/visasim/fraudservice/repository/FraudCheckRepository.class
+com/visasim/fraudservice/controller/FraudCheckController$EvaluateResponse.class
+com/visasim/fraudservice/config/RestClientConfig.class

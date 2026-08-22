@@ -1,21 +1,20 @@
 package com.visasim.userservice.service;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.UUID;
 
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
+import com.visasim.userservice.client.FraudServiceClient;
 import com.visasim.userservice.event.TransactionCompletedEvent;
 import com.visasim.userservice.exceptions.DuplicateRequestException;
 import com.visasim.userservice.exceptions.FraudBlockedException;
 import com.visasim.userservice.exceptions.TransactionNotFoundException;
 import com.visasim.userservice.exceptions.WalletNotFoundException;
-import com.visasim.userservice.model.FraudCheck;
-import com.visasim.userservice.model.FraudDecision;
 import com.visasim.userservice.model.Transaction;
 import com.visasim.userservice.model.Wallet;
-import com.visasim.userservice.repository.FraudCheckRepository;
 import com.visasim.userservice.repository.TransactionRepository;
 import com.visasim.userservice.repository.WalletRepository;
 
@@ -28,8 +27,7 @@ public class TransactionService {
     private final TransactionEventProducer eventProducer;
     private final TransactionTemplate transactionTemplate;
     private final IdempotencyService idempotencyService;
-    private final FraudCheckService fraudCheckService;
-    private final FraudCheckRepository fraudCheckRepository;
+    private final FraudServiceClient fraudServiceClient;
 
     public TransactionService(WalletRepository walletRepository,
                                TransactionRepository transactionRepository,
@@ -37,16 +35,14 @@ public class TransactionService {
                                TransactionEventProducer eventProducer,
                                TransactionTemplate transactionTemplate,
                                IdempotencyService idempotencyService,
-                               FraudCheckService fraudCheckService,
-                               FraudCheckRepository fraudCheckRepository) {
+                               FraudServiceClient fraudServiceClient) {
         this.walletRepository = walletRepository;
         this.transactionRepository = transactionRepository;
         this.transactionAuditService = transactionAuditService;
         this.eventProducer = eventProducer;
         this.transactionTemplate = transactionTemplate;
         this.idempotencyService = idempotencyService;
-        this.fraudCheckService = fraudCheckService;
-        this.fraudCheckRepository = fraudCheckRepository;
+        this.fraudServiceClient = fraudServiceClient;
     }
 
     public Transaction transfer(UUID fromWalletId, UUID toWalletId, BigDecimal amount, String idempotencyKey) {
@@ -55,10 +51,10 @@ public class TransactionService {
             throw new DuplicateRequestException(idempotencyKey);
         }
 
-        FraudCheck fraudCheck = fraudCheckService.evaluate(fromWalletId, toWalletId, amount);
+        FraudServiceClient.EvaluateResponse fraudCheck = fraudServiceClient.evaluate(fromWalletId, toWalletId, amount);
 
-        if (fraudCheck.getDecision() == FraudDecision.BLOCK) {
-            throw new FraudBlockedException(fraudCheck.getReasons());
+        if ("BLOCK".equals(fraudCheck.decision())) {
+            throw new FraudBlockedException(fraudCheck.reasons());
         }
 
         Transaction transaction = transactionTemplate.execute(status -> {
@@ -87,9 +83,6 @@ public class TransactionService {
             }
         });
 
-        fraudCheck.linkToTransaction(transaction.getId());
-        fraudCheckRepository.save(fraudCheck);
-
         // Publish only AFTER the database transaction has fully committed.
         // If the transfer failed, this line is never reached (the exception
         // propagated out of transactionTemplate.execute() above).
@@ -102,11 +95,17 @@ public class TransactionService {
                 transaction.getCreatedAt()
         ));
 
+        fraudServiceClient.linkTransaction(fraudCheck.id(), transaction.getId());
+
         return transaction;
     }
 
     public Transaction getById(UUID id) {
         return transactionRepository.findById(id)
                 .orElseThrow(() -> new TransactionNotFoundException(id));
+    }
+
+    public List<Transaction> getRecentHistory(UUID walletId) {
+        return transactionRepository.findTop20ByFromWalletIdOrderByCreatedAtDesc(walletId);
     }
 }

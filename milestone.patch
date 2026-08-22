@@ -1,0 +1,434 @@
+diff --git a/docker-compose.yml b/docker-compose.yml
+index 50b4adc..3961cfb 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -73,10 +73,58 @@ services:
+       SPRING_DATA_REDIS_HOST: redis
+       SPRING_DATA_REDIS_PORT: 6379
+ 
++      FRAUD_SERVICE_BASE_URL: http://fraud-service:8082
++
+     depends_on:
+       - postgres
+       - kafka
+       - redis
+ 
++  fraud-service:
++    build:
++      context: ./fraud-service
++    container_name: visasim-fraud-service
++    ports:
++      - "8082:8082"
++
++    environment:
++      SPRING_DATASOURCE_URL: jdbc:postgresql://fraud-postgres:5432/visasim_fraud
++      SPRING_DATASOURCE_USERNAME: visasim
++      SPRING_DATASOURCE_PASSWORD: visasim_dev_password
++
++      SPRING_DATA_REDIS_HOST: redis
++      SPRING_DATA_REDIS_PORT: 6379
++
++      USER_SERVICE_BASE_URL: http://user-service:8081
++
++    depends_on:
++      - fraud-postgres
++      - redis
++      - user-service
++
++  notification-service:
++    build:
++      context: ./notification-service
++    container_name: visasim-notification-service
++    environment:
++      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
++    depends_on:
++      - kafka
++
++  fraud-postgres:
++    image: postgres:16
++    container_name: visasim-fraud-postgres
++    restart: unless-stopped
++    environment:
++      POSTGRES_DB: visasim_fraud
++      POSTGRES_USER: visasim
++      POSTGRES_PASSWORD: visasim_dev_password
++    ports:
++      - "5433:5432"
++    volumes:
++      - fraud_postgres_data:/var/lib/postgresql/data
++
+ volumes:
+   postgres_data:
++  kafka_data:
++  fraud_postgres_data:
+diff --git a/user-service/src/main/java/com/visasim/userservice/controller/TransactionController.java b/user-service/src/main/java/com/visasim/userservice/controller/TransactionController.java
+index 1dc936f..3274d67 100644
+--- a/user-service/src/main/java/com/visasim/userservice/controller/TransactionController.java
++++ b/user-service/src/main/java/com/visasim/userservice/controller/TransactionController.java
+@@ -1,5 +1,6 @@
+ package com.visasim.userservice.controller;
+ 
++import java.util.List;
+ import java.util.UUID;
+ 
+ import org.springframework.http.HttpStatus;
+@@ -14,6 +15,7 @@ import org.springframework.web.bind.annotation.RestController;
+ import com.visasim.userservice.dto.TransactionResponse;
+ import com.visasim.userservice.dto.TransferRequest;
+ import com.visasim.userservice.model.Transaction;
++import com.visasim.userservice.repository.TransactionRepository;
+ import com.visasim.userservice.service.TransactionService;
+ 
+ import jakarta.validation.Valid;
+@@ -23,21 +25,49 @@ import jakarta.validation.Valid;
+ public class TransactionController {
+ 
+     private final TransactionService transactionService;
++    private final TransactionRepository transactionRepository;
++
++    public TransactionController(
++            TransactionService transactionService,
++            TransactionRepository transactionRepository) {
+ 
+-    public TransactionController(TransactionService transactionService) {
+         this.transactionService = transactionService;
++        this.transactionRepository = transactionRepository;
+     }
+ 
+     @PostMapping("/transfer")
+-    public ResponseEntity<TransactionResponse> transfer(@Valid @RequestBody TransferRequest request) {
++    public ResponseEntity<TransactionResponse> transfer(
++            @Valid @RequestBody TransferRequest request) {
++
+         Transaction transaction = transactionService.transfer(
+-                request.fromWalletId(), request.toWalletId(), request.amount(), request.idempotencyKey());
+-        return ResponseEntity.status(HttpStatus.CREATED).body(TransactionResponse.fromTransaction(transaction));
++                request.fromWalletId(),
++                request.toWalletId(),
++                request.amount(),
++                request.idempotencyKey());
++
++        return ResponseEntity
++                .status(HttpStatus.CREATED)
++                .body(TransactionResponse.fromTransaction(transaction));
+     }
+ 
+     @GetMapping("/{id}")
+-    public ResponseEntity<TransactionResponse> getTransaction(@PathVariable UUID id) {
++    public ResponseEntity<TransactionResponse> getTransaction(
++            @PathVariable UUID id) {
++
+         Transaction transaction = transactionService.getById(id);
+-        return ResponseEntity.ok(TransactionResponse.fromTransaction(transaction));
++
++        return ResponseEntity.ok(
++                TransactionResponse.fromTransaction(transaction));
++    }
++
++    @GetMapping("/history/{walletId}")
++    public ResponseEntity<List<Transaction>> getTransactionHistory(
++            @PathVariable UUID walletId) {
++
++        List<Transaction> history =
++                transactionRepository
++                        .findTop20ByFromWalletIdOrderByCreatedAtDesc(walletId);
++
++        return ResponseEntity.ok(history);
+     }
+ }
+\ No newline at end of file
+diff --git a/user-service/src/main/java/com/visasim/userservice/model/FraudCheck.java b/user-service/src/main/java/com/visasim/userservice/model/FraudCheck.java
+deleted file mode 100644
+index 243e1fa..0000000
+--- a/user-service/src/main/java/com/visasim/userservice/model/FraudCheck.java
++++ /dev/null
+@@ -1,62 +0,0 @@
+-package com.visasim.userservice.model;
+-
+-import java.time.Instant;
+-import java.util.UUID;
+-
+-import jakarta.persistence.Column;
+-import jakarta.persistence.Entity;
+-import jakarta.persistence.EnumType;
+-import jakarta.persistence.Enumerated;
+-import jakarta.persistence.Id;
+-import jakarta.persistence.Table;
+-
+-@Entity
+-@Table(name = "fraud_checks")
+-public class FraudCheck {
+-
+-    @Id
+-    private UUID id;
+-
+-    @Column(name = "transaction_id")
+-    private UUID transactionId;
+-
+-    @Column(name = "from_wallet_id", nullable = false)
+-    private UUID fromWalletId;
+-
+-    @Column(name = "risk_score", nullable = false)
+-    private int riskScore;
+-
+-    @Enumerated(EnumType.STRING)
+-    @Column(name = "decision", nullable = false, length = 20)
+-    private FraudDecision decision;
+-
+-    @Column(name = "reasons", columnDefinition = "TEXT")
+-    private String reasons;
+-
+-    @Column(name = "created_at", nullable = false)
+-    private Instant createdAt;
+-
+-    protected FraudCheck() {
+-    }
+-
+-    public FraudCheck(UUID fromWalletId, int riskScore, FraudDecision decision, String reasons) {
+-        this.id = UUID.randomUUID();
+-        this.fromWalletId = fromWalletId;
+-        this.riskScore = riskScore;
+-        this.decision = decision;
+-        this.reasons = reasons;
+-        this.createdAt = Instant.now();
+-    }
+-
+-    public void linkToTransaction(UUID transactionId) {
+-        this.transactionId = transactionId;
+-    }
+-
+-    public UUID getId() { return id; }
+-    public UUID getTransactionId() { return transactionId; }
+-    public UUID getFromWalletId() { return fromWalletId; }
+-    public int getRiskScore() { return riskScore; }
+-    public FraudDecision getDecision() { return decision; }
+-    public String getReasons() { return reasons; }
+-    public Instant getCreatedAt() { return createdAt; }
+-}
+\ No newline at end of file
+diff --git a/user-service/src/main/java/com/visasim/userservice/model/FraudDecision.java b/user-service/src/main/java/com/visasim/userservice/model/FraudDecision.java
+deleted file mode 100644
+index d4b1aaf..0000000
+--- a/user-service/src/main/java/com/visasim/userservice/model/FraudDecision.java
++++ /dev/null
+@@ -1,7 +0,0 @@
+-package com.visasim.userservice.model;
+-
+-public enum FraudDecision {
+-    ALLOW,
+-    FLAG,
+-    BLOCK
+-}
+\ No newline at end of file
+diff --git a/user-service/src/main/java/com/visasim/userservice/repository/FraudCheckRepository.java b/user-service/src/main/java/com/visasim/userservice/repository/FraudCheckRepository.java
+deleted file mode 100644
+index 4286ac8..0000000
+--- a/user-service/src/main/java/com/visasim/userservice/repository/FraudCheckRepository.java
++++ /dev/null
+@@ -1,10 +0,0 @@
+-package com.visasim.userservice.repository;
+-
+-import java.util.UUID;
+-
+-import org.springframework.data.jpa.repository.JpaRepository;
+-
+-import com.visasim.userservice.model.FraudCheck;
+-
+-public interface FraudCheckRepository extends JpaRepository<FraudCheck, UUID> {
+-}
+\ No newline at end of file
+diff --git a/user-service/src/main/java/com/visasim/userservice/service/FraudCheckService.java b/user-service/src/main/java/com/visasim/userservice/service/FraudCheckService.java
+deleted file mode 100644
+index d8b1eda..0000000
+--- a/user-service/src/main/java/com/visasim/userservice/service/FraudCheckService.java
++++ /dev/null
+@@ -1,94 +0,0 @@
+-package com.visasim.userservice.service;
+-
+-import com.visasim.userservice.model.FraudCheck;
+-import com.visasim.userservice.model.FraudDecision;
+-import com.visasim.userservice.repository.FraudCheckRepository;
+-import com.visasim.userservice.repository.TransactionRepository;
+-import org.springframework.data.redis.core.StringRedisTemplate;
+-import org.springframework.stereotype.Service;
+-
+-import java.math.BigDecimal;
+-import java.time.Duration;
+-import java.util.List;
+-import java.util.UUID;
+-
+-@Service
+-public class FraudCheckService {
+-
+-    private static final int VELOCITY_WINDOW_MINUTES = 1;
+-    private static final int VELOCITY_MAX_TRANSFERS = 5;
+-    private static final int VELOCITY_RISK_POINTS = 40;
+-
+-    private static final BigDecimal LARGE_AMOUNT_MULTIPLIER = new BigDecimal("5");
+-    private static final int LARGE_AMOUNT_RISK_POINTS = 30;
+-
+-    private static final int SELF_TRANSFER_RISK_POINTS = 100;
+-
+-    private static final int BLOCK_THRESHOLD = 70;
+-    private static final int FLAG_THRESHOLD = 30;
+-
+-    private final StringRedisTemplate redisTemplate;
+-    private final TransactionRepository transactionRepository;
+-    private final FraudCheckRepository fraudCheckRepository;
+-
+-    public FraudCheckService(StringRedisTemplate redisTemplate,
+-                              TransactionRepository transactionRepository,
+-                              FraudCheckRepository fraudCheckRepository) {
+-        this.redisTemplate = redisTemplate;
+-        this.transactionRepository = transactionRepository;
+-        this.fraudCheckRepository = fraudCheckRepository;
+-    }
+-
+-    public FraudCheck evaluate(UUID fromWalletId, UUID toWalletId, BigDecimal amount) {
+-        int riskScore = 0;
+-        StringBuilder reasons = new StringBuilder();
+-
+-        // Rule 1: self-transfer
+-        if (fromWalletId.equals(toWalletId)) {
+-            riskScore += SELF_TRANSFER_RISK_POINTS;
+-            reasons.append("Self-transfer detected. ");
+-        }
+-
+-        // Rule 2: velocity check
+-        String velocityKey = "fraud-velocity:" + fromWalletId;
+-        Long recentCount = redisTemplate.opsForValue().increment(velocityKey);
+-        if (recentCount != null && recentCount == 1L) {
+-            redisTemplate.expire(velocityKey, Duration.ofMinutes(VELOCITY_WINDOW_MINUTES));
+-        }
+-        if (recentCount != null && recentCount > VELOCITY_MAX_TRANSFERS) {
+-            riskScore += VELOCITY_RISK_POINTS;
+-            reasons.append("Velocity exceeded: ").append(recentCount)
+-                    .append(" transfers in ").append(VELOCITY_WINDOW_MINUTES).append(" min. ");
+-        }
+-
+-        // Rule 3: large-amount check
+-        List<com.visasim.userservice.model.Transaction> history =
+-                transactionRepository.findTop20ByFromWalletIdOrderByCreatedAtDesc(fromWalletId);
+-        if (!history.isEmpty()) {
+-            BigDecimal average = history.stream()
+-                    .map(com.visasim.userservice.model.Transaction::getAmount)
+-                    .reduce(BigDecimal.ZERO, BigDecimal::add)
+-                    .divide(new BigDecimal(history.size()), 4, java.math.RoundingMode.HALF_UP);
+-
+-            BigDecimal threshold = average.multiply(LARGE_AMOUNT_MULTIPLIER);
+-            if (amount.compareTo(threshold) > 0) {
+-                riskScore += LARGE_AMOUNT_RISK_POINTS;
+-                reasons.append("Amount ").append(amount)
+-                        .append(" exceeds 5x historical average (").append(average).append("). ");
+-            }
+-        }
+-
+-        FraudDecision decision;
+-        if (riskScore >= BLOCK_THRESHOLD) {
+-            decision = FraudDecision.BLOCK;
+-        } else if (riskScore >= FLAG_THRESHOLD) {
+-            decision = FraudDecision.FLAG;
+-        } else {
+-            decision = FraudDecision.ALLOW;
+-        }
+-
+-        FraudCheck check = new FraudCheck(fromWalletId, riskScore, decision,
+-                reasons.length() > 0 ? reasons.toString() : "No risk factors detected.");
+-        return fraudCheckRepository.save(check);
+-    }
+-}
+\ No newline at end of file
+diff --git a/user-service/src/main/java/com/visasim/userservice/service/TransactionService.java b/user-service/src/main/java/com/visasim/userservice/service/TransactionService.java
+index f75679b..7021b97 100644
+--- a/user-service/src/main/java/com/visasim/userservice/service/TransactionService.java
++++ b/user-service/src/main/java/com/visasim/userservice/service/TransactionService.java
+@@ -6,16 +6,14 @@ import java.util.UUID;
+ import org.springframework.stereotype.Service;
+ import org.springframework.transaction.support.TransactionTemplate;
+ 
++import com.visasim.userservice.client.FraudServiceClient;
+ import com.visasim.userservice.event.TransactionCompletedEvent;
+ import com.visasim.userservice.exceptions.DuplicateRequestException;
+ import com.visasim.userservice.exceptions.FraudBlockedException;
+ import com.visasim.userservice.exceptions.TransactionNotFoundException;
+ import com.visasim.userservice.exceptions.WalletNotFoundException;
+-import com.visasim.userservice.model.FraudCheck;
+-import com.visasim.userservice.model.FraudDecision;
+ import com.visasim.userservice.model.Transaction;
+ import com.visasim.userservice.model.Wallet;
+-import com.visasim.userservice.repository.FraudCheckRepository;
+ import com.visasim.userservice.repository.TransactionRepository;
+ import com.visasim.userservice.repository.WalletRepository;
+ 
+@@ -28,8 +26,7 @@ public class TransactionService {
+     private final TransactionEventProducer eventProducer;
+     private final TransactionTemplate transactionTemplate;
+     private final IdempotencyService idempotencyService;
+-    private final FraudCheckService fraudCheckService;
+-    private final FraudCheckRepository fraudCheckRepository;
++    private final FraudServiceClient fraudServiceClient;
+ 
+     public TransactionService(WalletRepository walletRepository,
+                                TransactionRepository transactionRepository,
+@@ -37,16 +34,14 @@ public class TransactionService {
+                                TransactionEventProducer eventProducer,
+                                TransactionTemplate transactionTemplate,
+                                IdempotencyService idempotencyService,
+-                               FraudCheckService fraudCheckService,
+-                               FraudCheckRepository fraudCheckRepository) {
++                               FraudServiceClient fraudServiceClient) {
+         this.walletRepository = walletRepository;
+         this.transactionRepository = transactionRepository;
+         this.transactionAuditService = transactionAuditService;
+         this.eventProducer = eventProducer;
+         this.transactionTemplate = transactionTemplate;
+         this.idempotencyService = idempotencyService;
+-        this.fraudCheckService = fraudCheckService;
+-        this.fraudCheckRepository = fraudCheckRepository;
++        this.fraudServiceClient = fraudServiceClient;
+     }
+ 
+     public Transaction transfer(UUID fromWalletId, UUID toWalletId, BigDecimal amount, String idempotencyKey) {
+@@ -55,10 +50,10 @@ public class TransactionService {
+             throw new DuplicateRequestException(idempotencyKey);
+         }
+ 
+-        FraudCheck fraudCheck = fraudCheckService.evaluate(fromWalletId, toWalletId, amount);
++        FraudServiceClient.EvaluateResponse fraudCheck = fraudServiceClient.evaluate(fromWalletId, toWalletId, amount);
+ 
+-        if (fraudCheck.getDecision() == FraudDecision.BLOCK) {
+-            throw new FraudBlockedException(fraudCheck.getReasons());
++        if ("BLOCK".equals(fraudCheck.decision())) {
++            throw new FraudBlockedException(fraudCheck.reasons());
+         }
+ 
+         Transaction transaction = transactionTemplate.execute(status -> {
+@@ -87,9 +82,6 @@ public class TransactionService {
+             }
+         });
+ 
+-        fraudCheck.linkToTransaction(transaction.getId());
+-        fraudCheckRepository.save(fraudCheck);
+-
+         // Publish only AFTER the database transaction has fully committed.
+         // If the transfer failed, this line is never reached (the exception
+         // propagated out of transactionTemplate.execute() above).
+diff --git a/user-service/src/main/resources/db/migration/V5__create_fraud_checks_table.sql b/user-service/src/main/resources/db/migration/V5__create_fraud_checks_table.sql
+deleted file mode 100644
+index c20f8e3..0000000
+--- a/user-service/src/main/resources/db/migration/V5__create_fraud_checks_table.sql
++++ /dev/null
+@@ -1,12 +0,0 @@
+-CREATE TABLE fraud_checks (
+-    id UUID PRIMARY KEY,
+-    transaction_id UUID,
+-    from_wallet_id UUID NOT NULL,
+-    risk_score INT NOT NULL,
+-    decision VARCHAR(20) NOT NULL,
+-    reasons TEXT,
+-    created_at TIMESTAMPTZ NOT NULL,
+-    CONSTRAINT fk_fraud_checks_wallet FOREIGN KEY (from_wallet_id) REFERENCES wallets (id)
+-);
+-
+-CREATE INDEX idx_fraud_checks_from_wallet ON fraud_checks (from_wallet_id);
+\ No newline at end of file

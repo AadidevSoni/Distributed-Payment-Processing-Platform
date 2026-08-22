@@ -41,6 +41,9 @@ services:
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
 
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+
   redis:
     image: redis:7.4
     container_name: visasim-redis
@@ -73,10 +76,58 @@ services:
       SPRING_DATA_REDIS_HOST: redis
       SPRING_DATA_REDIS_PORT: 6379
 
+      FRAUD_SERVICE_BASE_URL: http://fraud-service:8082
+
     depends_on:
       - postgres
       - kafka
       - redis
 
+  fraud-service:
+    build:
+      context: ./fraud-service
+    container_name: visasim-fraud-service
+    ports:
+      - "8082:8082"
+
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://fraud-postgres:5432/visasim_fraud
+      SPRING_DATASOURCE_USERNAME: visasim
+      SPRING_DATASOURCE_PASSWORD: visasim_dev_password
+
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+
+      USER_SERVICE_BASE_URL: http://user-service:8081
+
+    depends_on:
+      - fraud-postgres
+      - redis
+      - user-service
+
+  notification-service:
+    build:
+      context: ./notification-service
+    container_name: visasim-notification-service
+    environment:
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    depends_on:
+      - kafka
+
+  fraud-postgres:
+    image: postgres:16
+    container_name: visasim-fraud-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: visasim_fraud
+      POSTGRES_USER: visasim
+      POSTGRES_PASSWORD: visasim_dev_password
+    ports:
+      - "5433:5432"
+    volumes:
+      - fraud_postgres_data:/var/lib/postgresql/data
+
 volumes:
   postgres_data:
+  kafka_data:
+  fraud_postgres_data:
