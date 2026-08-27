@@ -8,34 +8,35 @@ The goal is not maximum features — the goal is **maximum engineering quality**
 
 ## Project Goal
 
-Build a simplified, distributed version of a Visa-like payment backend, composed of independent microservices communicating over REST and Kafka, backed by PostgreSQL and Redis, with production concerns (security, idempotency, retries, rate limiting, fraud detection, monitoring) treated as first-class citizens rather than afterthoughts.
+Build a simplified, distributed version of a Visa-like payment backend, composed of independent microservices communicating over REST and Kafka, backed by PostgreSQL and Redis, with production concerns (idempotency, retries, rate limiting, fraud detection, monitoring, load testing) treated as first-class citizens rather than afterthoughts.
 
-### Target Architecture (Full Vision)
+### Architecture
 
-- **User Service** — user identity and profile management
-- **Wallet Service** — balance management per user
-- **Transaction Service** — payment initiation and processing
-- **Fraud Detection Service** — real-time transaction risk scoring
-- **Notification Service** — async user notifications
-- **Ledger Service** — immutable financial record-keeping
-- **API Gateway** — single entry point routing to all services
+As of Milestone 11, the platform is genuinely split into three independently deployable services, each with its own Maven project, own package root, own database (where applicable), and own Dockerfile:
 
-Currently, User/Wallet/Transaction/Fraud Detection all live inside a single `user-service` codebase (by design, for early milestones) — they'll be split into genuinely independent services in Milestone 11.
+- **user-service** (`:8081`) — Users, Wallets, Transactions. The core money-moving service.
+- **fraud-service** (`:8082`) — Rules-based fraud risk scoring, its own PostgreSQL database.
+- **notification-service** — Pure Kafka consumer, no database, no business API. Logs completed transactions; the eventual home of real user notifications.
+
+A Ledger Service and API Gateway remain in the original vision but are not yet built.
 
 ### Cross-Cutting Concerns
 
 | Concern | Status |
 |---|---|
-| PostgreSQL (persistence) | ✅ Implemented |
+| PostgreSQL (persistence, database-per-service) | ✅ Implemented |
 | Kafka (event-driven communication) | ✅ Implemented |
-| Redis (idempotency, rate limiting) | ✅ Implemented |
+| Redis (idempotency, rate limiting, fraud velocity) | ✅ Implemented |
 | Rules-based fraud detection | ✅ Implemented |
-| Docker (full stack containerized) | 🔄 In progress (Milestone 10) |
-| Distributed locking | ⬜ Planned (Milestone 11) |
+| Docker (full stack containerized) | ✅ Implemented |
+| Microservices split | ✅ Implemented |
+| Dead Letter Queue (Kafka) | ✅ Implemented |
+| Monitoring / observability (Prometheus + Grafana) | 🔄 In progress (Milestone 12) |
+| Performance / load testing (k6) | 🔄 In progress (Milestone 13) |
+| Distributed tracing | ⬜ Planned |
 | JWT Authentication + Spring Security | ⬜ Planned |
-| Monitoring / observability | ⬜ Planned (Milestone 12) |
-| Dead Letter Queue / retry topics | ⬜ Planned |
 | Transactional Outbox Pattern | ⬜ Planned (known limitation — see below) |
+| API Gateway | ⬜ Planned |
 
 ---
 
@@ -45,12 +46,14 @@ Currently, User/Wallet/Transaction/Fraud Detection all live inside a single `use
 |---|---|
 | Language | Java 21 |
 | Framework | Spring Boot 3.3.4 |
-| Build Tool | Maven (with Maven Wrapper) |
-| Persistence | PostgreSQL 16, Spring Data JPA, Flyway |
+| Build Tool | Maven (with Maven Wrapper, per service) |
+| Persistence | PostgreSQL 16 (separate DB per service), Spring Data JPA, Flyway |
 | Caching / Idempotency / Rate Limiting | Redis 7.4 |
-| Messaging | Apache Kafka 3.8 (KRaft mode) |
-| Containerization | Docker Compose |
-| API Docs | springdoc-openapi (Swagger UI) |
+| Messaging | Apache Kafka 3.8 (KRaft mode), 3 partitions, dead-letter topic on repeated consumer failure |
+| Containerization | Docker Compose, multi-stage Dockerfiles per service |
+| Monitoring | Prometheus + Grafana (in progress) |
+| Load Testing | k6 (in progress) |
+| API Docs | springdoc-openapi (Swagger UI) — user-service and fraud-service |
 | Security | Spring Security, JWT (planned) |
 
 ---
@@ -58,13 +61,15 @@ Currently, User/Wallet/Transaction/Fraud Detection all live inside a single `use
 ## Architecture Principles
 
 - **Layered / Clean Architecture** — dependencies flow inward; services never expose internal entities directly
-- **DTOs at every boundary** — request/response shapes are decoupled from persistence models
+- **DTOs at every boundary** — request/response shapes are decoupled from persistence models, including at service-to-service HTTP boundaries
 - **Constructor injection only** — no field injection, for immutability and testability
 - **Rich domain model** — invariant-enforcing logic (e.g. `Wallet.credit()`/`debit()`) lives on entities, not scattered across services
 - **Explicit transaction boundaries** — `TransactionTemplate` used over `@Transactional` where self-invocation or precise post-commit ordering matters (e.g. publishing Kafka events only after a DB commit)
 - **Defense in depth** — invariants validated at the DTO layer (Bean Validation), domain layer (entity methods), and database layer (constraints), independently
-- **Atomic check-then-act** — idempotency keys and rate limits use Redis's atomic primitives (`SETNX`, `INCR`) to avoid the same class of race condition that `@Version` optimistic locking solves at the database layer
-- **Each service is independently named and structured** (`com.visasim.<service-name>`) to reinforce true microservice ownership, even while co-located in this practice monorepo
+- **Atomic check-then-act** — idempotency keys, rate limits, and fraud velocity counters all use Redis's atomic primitives (`SETNX`, `INCR`) to avoid the same class of race condition that `@Version` optimistic locking solves at the database layer
+- **Database-per-service** — `user-service` and `fraud-service` each own a separate PostgreSQL database with no shared schema and no cross-database foreign keys; referential integrity across that boundary is a known, accepted trade-off (see Known Limitations)
+- **Sync where blocking is required, async where it isn't** — `user-service → fraud-service` is a synchronous REST call because a transfer cannot proceed without a fraud decision; `user-service → notification-service` is asynchronous via Kafka because notification delivery has no bearing on whether the payment itself succeeds
+- **Each service is independently named, structured, and deployable** (`com.visasim.<service-name>`), with its own `pom.xml`, `Dockerfile`, and (where applicable) database
 - **Conventional Commits** for all git history
 
 ---
@@ -74,31 +79,57 @@ Currently, User/Wallet/Transaction/Fraud Detection all live inside a single `use
 ```
 Distributed-Payment-Processing-Platform/
 ├── docker-compose.yml
-└── user-service/
+├── prometheus/
+│   └── prometheus.yml
+├── load-tests/
+│   └── transfer-load-test.js
+├── test-flow.sh
+│
+├── user-service/                  :8081
+│   ├── Dockerfile
+│   ├── pom.xml
+│   └── src/main/
+│       ├── java/com/visasim/userservice/
+│       │   ├── controller/          (Users, Wallets, Transactions)
+│       │   ├── service/
+│       │   ├── dto/
+│       │   ├── model/
+│       │   ├── repository/
+│       │   ├── client/              (FraudServiceClient)
+│       │   ├── event/               (TransactionCompletedEvent)
+│       │   ├── filter/               (rate limiting)
+│       │   ├── config/
+│       │   └── exceptions/
+│       └── resources/
+│           ├── application.yml
+│           └── db/migration/        (V1–V4)
+│
+├── fraud-service/                 :8082
+│   ├── Dockerfile
+│   ├── pom.xml
+│   └── src/main/
+│       ├── java/com/visasim/fraudservice/
+│       │   ├── controller/          (FraudCheckController)
+│       │   ├── service/             (FraudCheckService)
+│       │   ├── client/              (UserServiceClient)
+│       │   ├── dto/
+│       │   ├── model/
+│       │   ├── repository/
+│       │   └── config/
+│       └── resources/
+│           ├── application.yml
+│           └── db/migration/        (own V1, own database)
+│
+└── notification-service/           (Kafka consumer only)
     ├── Dockerfile
-    ├── .dockerignore
     ├── pom.xml
-    ├── .gitignore
-    └── src/
-        ├── main/
-        │   ├── java/com/visasim/userservice/
-        │   │   ├── controller/
-        │   │   ├── service/
-        │   │   ├── dto/
-        │   │   ├── model/
-        │   │   ├── repository/
-        │   │   ├── event/
-        │   │   ├── listener/
-        │   │   ├── filter/
-        │   │   ├── config/
-        │   │   └── exceptions/
-        │   └── resources/
-        │       ├── application.yml
-        │       └── db/migration/        (Flyway SQL migrations, V1–V5+)
-        └── test/
+    └── src/main/
+        ├── java/com/visasim/notificationservice/
+        │   ├── NotificationKafkaConsumer.java
+        │   ├── event/               (own copy of TransactionCompletedEvent)
+        │   └── config/              (dead-letter error handling)
+        └── resources/application.yml
 ```
-
-Additional services (`wallet-service`, `transaction-service`, etc.) will be split out as true siblings of `user-service` in Milestone 11.
 
 ---
 
@@ -115,112 +146,84 @@ Additional services (`wallet-service`, `transaction-service`, etc.) will be spli
 | 7 | Kafka (event-driven architecture) | ✅ Done |
 | 8 | Redis (idempotency + rate limiting) | ✅ Done |
 | 9 | Fraud Detection | ✅ Done |
-| 10 | Docker (containerize the app itself) | 🔄 In progress |
-| 11 | Microservices (multi-service split) | ⬜ Not started |
-| 12 | Monitoring | ⬜ Not started |
-| 13 | Performance Testing | ⬜ Not started |
+| 10 | Docker (containerize the app itself) | ✅ Done |
+| 11 | Microservices (multi-service split) | ✅ Done |
+| 12 | Monitoring (Prometheus + Grafana) | 🔄 In progress |
+| 13 | Performance Testing (k6) | 🔄 In progress |
 | 14 | Deployment | ⬜ Not started |
 
 ---
 
 ## What's Implemented So Far
 
-### Milestone 1 — Spring Boot Project Setup ✅
-- Bootstrapped `user-service` on Spring Boot 3.3.4 / Java 21
-- Maven Wrapper for reproducible builds
-- Embedded Tomcat on port `8081`, Actuator health check wired in
+### Milestones 1–9 — Foundation through Fraud Detection ✅
+Spring Boot + Java 21 scaffold, REST API with DTOs and global exception handling, PostgreSQL + Flyway, `Wallet` domain model with invariant-enforcing `credit()`/`debit()`, atomic multi-wallet `transfer()` with `TransactionAuditService` (`Propagation.REQUIRES_NEW`), a reproduced-and-fixed lost-update race condition (`@Version` optimistic locking + `TransactionTemplate` retry), Kafka event publishing (per-wallet key ordering, post-commit publish), Redis-backed idempotency keys and rate limiting, and a rules-based fraud engine (self-transfer, velocity, wallet-relative large-amount checks) producing weighted `ALLOW`/`FLAG`/`BLOCK` decisions with a full audit trail.
 
-### Milestone 2 — REST API ✅
-- `User` domain model, immutable record-based DTOs, Bean Validation
-- `POST /users`, `GET /users/{id}`
-- `GlobalExceptionHandler` (`@RestControllerAdvice`) for consistent error responses
-- Constructor-based dependency injection throughout
+### Milestone 10 — Docker ✅
+Multi-stage Dockerfile per service (JDK build stage → slim JRE runtime stage). Full stack — every service and every infrastructure dependency — starts with a single `docker compose up -d --build`.
 
-### Milestone 3 — PostgreSQL Integration ✅
-- PostgreSQL 16 via Docker, Spring Data JPA, Flyway migrations
-- `ddl-auto: validate` — Hibernate never auto-modifies schema; Flyway owns all schema changes
-- `User` converted to a real `@Entity`, backed by `UserRepository`
+### Milestone 11 — Microservices ✅
+- Extracted **fraud-service**: standalone Spring Boot project, own PostgreSQL database (`visasim_fraud`, its own Flyway history), own `pom.xml` with only the dependencies it needs
+- Extracted **notification-service**: standalone Kafka consumer, no database, no business API
+- `user-service` now calls `fraud-service` synchronously over HTTP (`FraudServiceClient` → `POST /fraud-checks/evaluate`); the in-process method call became a real network call with real new failure modes
+- **`PATCH /fraud-checks/{id}/link`** restores the `transaction_id` audit correlation on `fraud_checks` that was lost the moment fraud evaluation moved out-of-process — successful transfers link back to their fraud check; blocked transfers correctly stay unlinked
+- Kafka's dead-letter handling added: `DeadLetterPublishingRecoverer` + bounded `FixedBackOff`, so a poison message retries once then routes to a dead-letter topic instead of retrying forever
+- `notification-service` consumes with `concurrency=3`, matching the topic's 3 partitions, under its own consumer group
 
-### Milestone 4 — Wallets ✅
-- `Wallet` entity, one-to-one with `User`, `BigDecimal`/`NUMERIC(19,4)` for money (never floating point)
-- Domain-level `credit()`/`debit()` methods enforcing invariants (balance can never go negative)
-- `CreditRequest`/`DebitRequest` DTOs with `@DecimalMin` validation
+### Milestone 12 — Monitoring 🔄
+Micrometer + Prometheus registry being wired into all three services; Grafana dashboards for request rate and error rate. Not yet fully verified end-to-end — see Known Limitations.
 
-### Milestone 5 — Transactions ✅
-- `Transaction` entity, append-only, starts `PENDING` → `COMPLETED`/`FAILED`
-- Atomic wallet-to-wallet `transfer()` — full rollback on failure
-- `TransactionAuditService` using `Propagation.REQUIRES_NEW` so failed-transaction audit records survive rollback of the main transfer
-
-### Milestone 6 — Concurrency ✅
-- Reproduced a real lost-update race condition under concurrent wallet credits (10-thread test)
-- Fixed with `@Version` optimistic locking
-- `WalletService` refactored to use `TransactionTemplate` with retry + exponential backoff, avoiding Spring's self-invocation proxy limitation entirely
-
-### Milestone 7 — Kafka ✅
-- Kafka (KRaft mode, no Zookeeper) via Docker
-- `TransactionCompletedEvent` as an explicit event contract, decoupled from internal DTOs
-- Events keyed by `fromWalletId` to preserve per-wallet ordering across partitions
-- Producer publishes only *after* the DB transaction commits (mitigates, but doesn't fully solve, the dual-write problem — see Known Limitations)
-- Stand-in consumer (`TransactionEventListener`) — future home of the real Notification Service
-
-### Milestone 8 — Redis ✅
-- Idempotency keys on `/transactions/transfer`, enforced via atomic `SETNX` with 24h TTL
-- Fixed-window rate limiting (20 req/min per IP) via atomic `INCR`, returns `429` when exceeded
-- **Known limitation:** a failed transfer still permanently consumes its idempotency key (see below)
-
-### Milestone 9 — Fraud Detection ✅
-- Rules-based risk engine: self-transfer check, Redis-backed velocity check, wallet-relative large-amount check
-- Weighted risk scoring → `ALLOW` / `FLAG` / `BLOCK` decisions
-- `fraud_checks` table as a full audit trail — including blocked attempts that never became a `Transaction` (`transaction_id` is nullable by design)
-- `BLOCK` returns `403 Forbidden`; `FLAG` allows the transfer but logs it for review
-
-### Milestone 10 — Docker 🔄
-- Multi-stage `Dockerfile` (JDK build stage → slim JRE runtime stage)
-- `user-service` added to `docker-compose.yml`, networked with Postgres/Kafka/Redis via Compose service-name hostnames
-- Goal: full stack (`app` + all infra) starts with a single `docker compose up -d --build`
+### Milestone 13 — Performance Testing 🔄
+k6 load test against `POST /transactions/transfer`, ramping virtual users, with p95/p99 latency and error-rate thresholds. In progress.
 
 ---
 
 ## Known Limitations (Deliberate, Flagged Honestly)
 
-- **Dual-write problem (Kafka):** the DB commit and the Kafka publish are two separate operations. Publishing after commit avoids "announcing" a transfer that never happened, but a Kafka publish failure *after* a successful commit would still go unnoticed. The correct fix — the **Transactional Outbox Pattern** — is a planned future extension.
-- **Idempotency key lifecycle (Redis):** currently, a failed transfer still burns its idempotency key for 24h, incorrectly blocking legitimate retries after a fix. The correct fix is to only mark the key as used on success, or cache-and-replay the response.
-- **Fixed-window rate limiting:** simple and effective, but allows short bursts across a window boundary. A sliding-window or token-bucket algorithm would close this gap.
+- **Circular service dependency:** `user-service` calls `fraud-service` for a risk decision; `fraud-service` calls back into `user-service`'s `GET /transactions/history/{walletId}` for its large-amount rule. Neither service can be fully tested or deployed in true isolation as a result. The correct fix — having `fraud-service` build its own local read-model from the `transaction-events` Kafka topic instead of a synchronous callback — is a planned extension, not yet implemented.
+- **Dual-write problem (Kafka):** the DB commit and the Kafka publish are two separate operations. Publishing after commit avoids "announcing" a transfer that never happened, but a Kafka publish failure *after* a successful commit would still go unnoticed. The correct fix — the **Transactional Outbox Pattern** — remains a planned extension.
+- **Idempotency key lifecycle (Redis):** a failed transfer still burns its idempotency key for 24h, incorrectly blocking legitimate retries after a fix. The correct fix is to only mark the key as used on success, or cache-and-replay the response.
+- **Fixed-window rate limiting:** simple and effective, but allows short bursts across a window boundary.
+- **Lost referential integrity across service boundaries:** `fraud_checks.from_wallet_id` and `.transaction_id` are plain UUIDs with no database-enforced foreign key, since the referenced tables live in a different service's database. Integrity here is an application-level assumption, not a guarantee.
+- **No resilience on the `user-service → fraud-service` HTTP call:** no timeout, retry, or circuit breaker configured yet. If `fraud-service` is slow or unreachable, every transfer currently blocks or fails ungracefully.
+- **`depends_on` in Docker Compose guarantees container start order only**, not readiness — relevant now that `user-service`, `fraud-service`, and their databases all depend on each other starting in a reasonable sequence.
 
 ---
 
 ## Running the Project
 
-### Option A — Full stack via Docker Compose (recommended)
+### Full stack via Docker Compose
 
 ```bash
 docker compose up -d --build
 ```
 
-Brings up Postgres, Kafka, Redis, and `user-service` together. No local Java/Maven setup required.
+Brings up Postgres (×2, one per service that needs it), Kafka, Redis, and all three application services together.
 
-### Option B — App locally, infra via Docker
-
-```bash
-docker compose up -d postgres kafka redis
-cd user-service
-export JAVA_HOME=$(/usr/libexec/java_home -v 21)
-./mvnw spring-boot:run
-```
-
-### Verify it's alive
+### Verify services are alive
 
 ```bash
-curl http://localhost:8081/actuator/health
+curl http://localhost:8081/actuator/health   # user-service
+curl http://localhost:8082/actuator/health   # fraud-service
 ```
 
 ### Interactive API testing
 
-Swagger UI: [http://localhost:8081/swagger-ui.html](http://localhost:8081/swagger-ui.html)
+Swagger UI:
+- [http://localhost:8081/swagger-ui/index.html](http://localhost:8081/swagger-ui/index.html) — user-service
+- [http://localhost:8082/swagger-ui/index.html](http://localhost:8082/swagger-ui/index.html) — fraud-service
 
-Or use the included test script, which chains user/wallet/transfer creation and auto-extracts IDs:
+Or the included regression script, which chains user/wallet/transfer creation and auto-extracts IDs:
 ```bash
 ./test-flow.sh
+```
+
+### Inspecting each service's data directly
+
+```bash
+docker exec -it visasim-postgres psql -U visasim -d visasim              # user-service DB
+docker exec -it visasim-fraud-postgres psql -U visasim -d visasim_fraud  # fraud-service DB
+docker exec -it visasim-redis redis-cli                                  # idempotency + velocity keys
 ```
 
 ---
@@ -246,7 +249,7 @@ curl -X POST http://localhost:8081/wallets/{walletId}/credit \
   -d '{"amount": 100.00}'
 ```
 
-**Transfer between wallets (idempotent):**
+**Transfer between wallets (idempotent, fraud-checked, published to Kafka on success):**
 ```bash
 curl -X POST http://localhost:8081/transactions/transfer \
   -H "Content-Type: application/json" \
@@ -257,8 +260,9 @@ curl -X POST http://localhost:8081/transactions/transfer \
 
 ## Requirements
 
-- Docker Desktop (recommended path), **or**
-- Java 21 (LTS) + Docker Desktop for infra-only (Maven not required — wrapper included)
+- Docker Desktop (required — the full stack is now multi-service and expects to run via Compose)
+- Java 21 (LTS), if running any service outside Docker for local development
+- [k6](https://k6.io) for load testing (`brew install k6`)
 
 ---
 
